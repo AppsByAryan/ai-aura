@@ -21,6 +21,7 @@ import com.example.aura.data.PairedDeviceEntity
 import com.example.aura.data.RememberedPermissionEntity
 import com.example.aura.data.SystemTelemetry
 import com.example.aura.service.AndroidExecutor
+import com.example.aura.service.AuraNotificationManager
 import com.example.aura.service.AuraVoiceInteractionService
 import com.example.aura.service.ExecutionResult
 import com.example.aura.service.SystemTelemetryManager
@@ -51,6 +52,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     private val telemetryManager = SystemTelemetryManager(context)
     private val executor = AndroidExecutor(context)
     private val aiService = AuraAiService()
+    private val notificationManager = AuraNotificationManager(context)
 
     private val _auraState = MutableStateFlow(AuraState.IDLE)
     val auraState: StateFlow<AuraState> = _auraState.asStateFlow()
@@ -70,6 +72,19 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _isVoiceOutputEnabled = MutableStateFlow(true)
     val isVoiceOutputEnabled: StateFlow<Boolean> = _isVoiceOutputEnabled.asStateFlow()
+
+    // Autonomous Direct Execution Mode (Never ask for permission when true)
+    private val _isDirectExecution = MutableStateFlow(preferences.isDirectExecution)
+    val isDirectExecution: StateFlow<Boolean> = _isDirectExecution.asStateFlow()
+
+    fun setDirectExecution(enabled: Boolean) {
+        _isDirectExecution.value = enabled
+        preferences.isDirectExecution = enabled
+        addSystemMessage(
+            if (enabled) "Autonomous execution enabled: AURA will execute all commands directly without asking for permission."
+            else "Permission confirmation mode enabled: AURA will ask once before executing actions."
+        )
+    }
 
     // Wake Word State
     private val _isWakeWordEnabled = MutableStateFlow(preferences.isWakeWordEnabled)
@@ -126,12 +141,16 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
     private val wakeWordEngine: WakeWordEngine by lazy {
         WakeWordEngine(
             context = context,
-            onWakeWordDetected = { detectedWord ->
+            onWakeWordDetected = { detectedWord, extraCommand ->
                 viewModelScope.launch {
-                    addSystemMessage("🎙️ Wake word '$detectedWord' recognized. Standing by for command...")
-                    _auraState.value = AuraState.LISTENING
-                    delay(200)
-                    voiceManager.startListening()
+                    addSystemMessage("🎙️ Wake word '$detectedWord' recognized.")
+                    if (!extraCommand.isNullOrBlank()) {
+                        submitCommand(extraCommand)
+                    } else {
+                        _auraState.value = AuraState.LISTENING
+                        delay(150)
+                        voiceManager.startListening()
+                    }
                 }
             },
             onListeningStateChanged = { listening ->
@@ -155,7 +174,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                 repository.saveChatMessage(
                     ChatMessage(
                         sender = MessageSender.AURA,
-                        text = "I am AURA — the One and Only AURA, created by Aryan Yadav, a student of Class 10th. All device operations are strictly permission-first. What command shall we execute?"
+                        text = "I am AURA — the One and Only AURA, created by Aryan Yadav, a student of Class 10th. What command shall we execute?"
                     )
                 )
             }
@@ -302,6 +321,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     repository.saveChatMessage(auraMsg)
                     voiceManager.speak(reply)
+                    notificationManager.showWorkDoneNotification("Answer Ready", reply)
                     delay(1200)
                     _auraState.value = AuraState.IDLE
                     wakeWordEngine.setSuspended(false)
@@ -318,6 +338,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     repository.saveChatMessage(auraMsg)
                     voiceManager.speak(reply)
+                    notificationManager.showWorkDoneNotification("Battery Status", reply)
                     repository.recordAction(
                         command = clean,
                         actionType = ActionType.GET_BATTERY_INFO,
@@ -343,6 +364,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     repository.saveChatMessage(auraMsg)
                     voiceManager.speak(reply)
+                    notificationManager.showWorkDoneNotification("Storage Info", reply)
                     repository.recordAction(
                         command = clean,
                         actionType = ActionType.GET_STORAGE_INFO,
@@ -368,6 +390,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     repository.saveChatMessage(auraMsg)
                     voiceManager.speak(reply)
+                    notificationManager.showWorkDoneNotification("Memory Info", reply)
                     delay(1200)
                     _auraState.value = AuraState.IDLE
                     wakeWordEngine.setSuspended(false)
@@ -384,6 +407,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     repository.saveChatMessage(auraMsg)
                     voiceManager.speak(reply)
+                    notificationManager.showWorkDoneNotification("Network Info", reply)
                     delay(1200)
                     _auraState.value = AuraState.IDLE
                     wakeWordEngine.setSuspended(false)
@@ -395,27 +419,32 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
                 // Device actions (App launching, Volume, Media, Settings, Remote, etc.)
                 else -> {
-                    // Check if permission for this action was already granted and remembered
-                    val permKey = getPermissionKey(validatedPlan)
-                    val isRemembered = repository.isPermissionRemembered(permKey)
-
-                    if (isRemembered) {
-                        // Already authorized! Execute directly without asking again, and speak the result!
+                    if (_isDirectExecution.value) {
+                        // Autonomous Direct Execution: Execute immediately without asking permission for anything!
                         executeActionPlan(validatedPlan, isPreAuthorized = true)
                     } else {
-                        // Ask once!
-                        _auraState.value = AuraState.WAITING
-                        _pendingAction.value = validatedPlan
+                        // Check if permission for this action was already granted and remembered
+                        val permKey = getPermissionKey(validatedPlan)
+                        val isRemembered = repository.isPermissionRemembered(permKey)
 
-                        val promptText = "I can perform '${validatedPlan.description}' on ${validatedPlan.device}. Allow?"
-                        val auraMsg = ChatMessage(
-                            sender = MessageSender.AURA,
-                            text = promptText,
-                            actionPlan = validatedPlan,
-                            actionStatus = ActionStatus.PENDING
-                        )
-                        repository.saveChatMessage(auraMsg)
-                        voiceManager.speak("Awaiting your authorization to ${validatedPlan.description}.")
+                        if (isRemembered) {
+                            // Already authorized! Execute directly without asking again, and speak the result!
+                            executeActionPlan(validatedPlan, isPreAuthorized = true)
+                        } else {
+                            // Ask once!
+                            _auraState.value = AuraState.WAITING
+                            _pendingAction.value = validatedPlan
+
+                            val promptText = "I can perform '${validatedPlan.description}' on ${validatedPlan.device}. Allow?"
+                            val auraMsg = ChatMessage(
+                                sender = MessageSender.AURA,
+                                text = promptText,
+                                actionPlan = validatedPlan,
+                                actionStatus = ActionStatus.PENDING
+                            )
+                            repository.saveChatMessage(auraMsg)
+                            voiceManager.speak("Awaiting your authorization to ${validatedPlan.description}.")
+                        }
                     }
                 }
             }
@@ -459,7 +488,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
                 is ExecutionResult.Success -> {
                     _auraState.value = AuraState.SUCCESS
                     val completionMsg = result.message
-                    val displayMsg = if (isPreAuthorized) "[Authorized] $completionMsg" else completionMsg
+                    val displayMsg = completionMsg
 
                     val resultChatMsg = ChatMessage(
                         sender = MessageSender.AURA,
@@ -469,6 +498,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
                     // Speak the result out loud
                     voiceManager.speak(completionMsg)
+                    notificationManager.showWorkDoneNotification(plan.description, completionMsg)
 
                     repository.recordAction(
                         command = plan.description,
@@ -497,6 +527,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
                     // Speak failure message out loud
                     voiceManager.speak(failMsg)
+                    notificationManager.showWorkDoneNotification("Action Notice", failMsg)
 
                     repository.recordAction(
                         command = plan.description,
@@ -555,6 +586,7 @@ class AuraViewModel(application: Application) : AndroidViewModel(application) {
 
         addSystemMessage(reason)
         voiceManager.speak("Operation halted.")
+        notificationManager.showWorkDoneNotification("Emergency Override", reason)
         wakeWordEngine.setSuspended(false)
 
         viewModelScope.launch {

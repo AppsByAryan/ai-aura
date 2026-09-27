@@ -11,9 +11,14 @@ class AuraPreferences(context: Context) {
         private const val KEY_WAKE_WORD_ENABLED = "key_wake_word_enabled"
         private const val KEY_WAKE_WORD_PHRASE = "key_wake_word_phrase"
         private const val KEY_WAKE_WORD_SENSITIVITY = "key_wake_word_sensitivity"
+        private const val KEY_DIRECT_EXECUTION = "key_direct_execution"
         const val DEFAULT_WAKE_WORD = "Hey AURA"
         const val DEFAULT_SENSITIVITY = 0.7f
     }
+
+    var isDirectExecution: Boolean
+        get() = prefs.getBoolean(KEY_DIRECT_EXECUTION, true)
+        set(value) = prefs.edit().putBoolean(KEY_DIRECT_EXECUTION, value).apply()
 
     var isWakeWordEnabled: Boolean
         get() = prefs.getBoolean(KEY_WAKE_WORD_ENABLED, false)

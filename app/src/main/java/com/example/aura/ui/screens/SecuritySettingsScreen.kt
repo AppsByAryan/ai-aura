@@ -102,6 +102,7 @@ fun SecuritySettingsScreen(
     val wakeWordSensitivity by viewModel.wakeWordSensitivity.collectAsStateWithLifecycle()
     val isWakeWordListening by viewModel.isWakeWordListening.collectAsStateWithLifecycle()
     val rememberedPermissions by viewModel.rememberedPermissions.collectAsStateWithLifecycle()
+    val isDirectExecution by viewModel.isDirectExecution.collectAsStateWithLifecycle()
 
     var customWakeWordInput by remember(wakeWordPhrase) { mutableStateOf(wakeWordPhrase) }
 
@@ -181,6 +182,69 @@ fun SecuritySettingsScreen(
                             )
                         }
                     }
+                }
+            }
+
+            // AUTONOMOUS DIRECT EXECUTION (ZERO PERMISSION PROMPTS) CARD
+            GlassCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("direct_execution_card"),
+                borderColor = if (isDirectExecution) AuraCyan else AuraBorderGlow
+            ) {
+                Column {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Bolt,
+                                contentDescription = null,
+                                tint = if (isDirectExecution) AuraCyan else AuraTextMuted,
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column {
+                                Text(
+                                    text = "AUTONOMOUS EXECUTION",
+                                    color = if (isDirectExecution) AuraCyan else AuraTextSecondary,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    letterSpacing = 1.sp
+                                )
+                                Text(
+                                    text = if (isDirectExecution) "Active • Never asks for permission" else "Prompt for permission",
+                                    color = if (isDirectExecution) AuraSuccess else AuraTextMuted,
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+
+                        Switch(
+                            checked = isDirectExecution,
+                            onCheckedChange = { viewModel.setDirectExecution(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.Black,
+                                checkedTrackColor = AuraCyan,
+                                uncheckedThumbColor = AuraTextMuted,
+                                uncheckedTrackColor = Color(0xFF13223A)
+                            ),
+                            modifier = Modifier.testTag("direct_execution_switch")
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Text(
+                        text = "When active, AURA never asks for permission for anything. Every command (launching apps, setting volume, playing media, screenshots, device settings) executes instantly and speaks the result out loud.",
+                        color = AuraTextSecondary,
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp
+                    )
                 }
             }
 
@@ -838,10 +902,70 @@ fun SecuritySettingsScreen(
                         )
                     }
 
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "Google Search Grounding:",
+                            color = AuraTextSecondary,
+                            fontSize = 12.sp
+                        )
+                        Text(
+                            text = "ACTIVE (Real-Time Web Data)",
+                            color = AuraSuccess,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "Google Maps Grounding:",
+                            color = AuraTextSecondary,
+                            fontSize = 12.sp
+                        )
+                        Text(
+                            text = "ACTIVE (Live Places & Routes)",
+                            color = AuraSuccess,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "Work Done Notifications:",
+                            color = AuraTextSecondary,
+                            fontSize = 12.sp
+                        )
+                        Text(
+                            text = "ACTIVE (Status & Results)",
+                            color = AuraCyan,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
                     Spacer(modifier = Modifier.height(8.dp))
 
                     Text(
-                        text = "Basic device operations (battery, storage, app launches, volume) always work 100% offline without requiring internet.",
+                        text = "AURA can answer any general, real-time, or location question using Gemini with Google Search and Maps data, while device operations work offline.",
                         color = AuraTextMuted,
                         fontSize = 11.sp,
                         lineHeight = 15.sp

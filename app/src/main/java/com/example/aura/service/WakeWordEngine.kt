@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -13,33 +15,28 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import androidx.core.content.ContextCompat
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 import java.util.Locale
 
 class WakeWordEngine(
     private val context: Context,
-    private val onWakeWordDetected: (String) -> Unit,
+    private val onWakeWordDetected: (wakePhrase: String, extraCommand: String?) -> Unit,
     private val onListeningStateChanged: (Boolean) -> Unit,
     private val onError: (String) -> Unit
 ) {
     private var isEnabled = false
     private var isRunning = false
-    private var isSuspended = false // Suspended while AURA is actively processing or speaking
+    private var isSuspended = false
 
     var wakeWordPhrase: String = "Hey AURA"
         private set
 
-    var sensitivity: Float = 0.7f // 0.1 (low) to 1.0 (high)
+    var sensitivity: Float = 0.7f
         private set
 
     private var speechRecognizer: SpeechRecognizer? = null
-    private var loopJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.Main)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var restartRunnable: Runnable? = null
+    private var isCurrentlyListening = false
 
     private val vibrator: Vibrator? by lazy {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -56,10 +53,12 @@ class WakeWordEngine(
         this.sensitivity = sens.coerceIn(0.1f, 1.0f)
         this.isEnabled = enabled
 
-        if (isEnabled && !isRunning) {
-            start()
-        } else if (!isEnabled && isRunning) {
-            stop()
+        mainHandler.post {
+            if (isEnabled && !isRunning) {
+                start()
+            } else if (!isEnabled && isRunning) {
+                stop()
+            }
         }
     }
 
@@ -73,132 +72,153 @@ class WakeWordEngine(
         }
 
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            onError("Speech recognition service unavailable on device.")
+            onError("Speech recognition service unavailable on this device.")
             return
         }
 
         isRunning = true
         onListeningStateChanged(true)
-        startRecognitionCycle()
+        initAndListen()
     }
 
     fun stop() {
         isRunning = false
-        loopJob?.cancel()
-        loopJob = null
+        cancelScheduledRestart()
         destroyRecognizer()
         onListeningStateChanged(false)
     }
 
-    /**
-     * Temporarily suspends the background wake word engine while AURA is speaking or executing
-     * an action, preventing feedback loops and conserving device resources.
-     */
     fun setSuspended(suspended: Boolean) {
         if (isSuspended == suspended) return
         isSuspended = suspended
-        if (suspended) {
-            destroyRecognizer()
-            onListeningStateChanged(false)
-        } else if (isRunning && isEnabled) {
-            onListeningStateChanged(true)
-            startRecognitionCycle()
+        mainHandler.post {
+            if (suspended) {
+                cancelScheduledRestart()
+                destroyRecognizer()
+                onListeningStateChanged(false)
+            } else if (isRunning && isEnabled) {
+                onListeningStateChanged(true)
+                initAndListen()
+            }
         }
     }
 
-    private fun startRecognitionCycle() {
+    private fun initAndListen() {
         if (!isRunning || isSuspended) return
 
-        destroyRecognizer()
+        cancelScheduledRestart()
 
         try {
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
-                setRecognitionListener(object : RecognitionListener {
-                    override fun onReadyForSpeech(params: Bundle?) {}
-                    override fun onBeginningOfSpeech() {}
-                    override fun onRmsChanged(rmsdB: Float) {}
-                    override fun onBufferReceived(buffer: ByteArray?) {}
-                    override fun onEndOfSpeech() {}
-
-                    override fun onError(error: Int) {
-                        // In wake-word continuous cycle, timeouts and NO_MATCH are expected.
-                        // We schedule the next lightweight cycle with an adaptive rest interval to save battery.
-                        scheduleNextCycle(if (error == SpeechRecognizer.ERROR_NO_MATCH) 250L else 1200L)
-                    }
-
-                    override fun onResults(results: Bundle?) {
-                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        processMatches(matches)
-                        scheduleNextCycle(150L)
-                    }
-
-                    override fun onPartialResults(partialResults: Bundle?) {
-                        val partials = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        if (partials != null && checkWakeWordMatch(partials)) {
-                            // Immediate trigger on partial result for ultra-fast response!
-                            triggerWakeWord()
-                        }
-                    }
-
-                    override fun onEvent(eventType: Int, params: Bundle?) {}
-                })
+            if (speechRecognizer == null) {
+                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
+                    setRecognitionListener(createListener())
+                }
             }
 
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-                // Short speech timeout to keep detection lightweight
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
             }
 
+            isCurrentlyListening = true
             speechRecognizer?.startListening(intent)
-        } catch (e: Exception) {
-            scheduleNextCycle(2000L)
+        } catch (_: Exception) {
+            destroyRecognizer()
+            scheduleRestart(1200L)
         }
     }
 
-    private fun scheduleNextCycle(delayMs: Long) {
-        if (!isRunning || isSuspended) return
+    private fun createListener(): RecognitionListener {
+        return object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {}
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
 
-        loopJob?.cancel()
-        loopJob = scope.launch {
-            // Adaptive sleep interval: higher sensitivity uses shorter delay, conserving CPU cycles
-            val adjustedDelay = (delayMs * (1.2f - (sensitivity * 0.4f))).toLong().coerceAtLeast(100L)
-            delay(adjustedDelay)
-            if (isActive && isRunning && !isSuspended) {
-                startRecognitionCycle()
+            override fun onEndOfSpeech() {
+                isCurrentlyListening = false
+            }
+
+            override fun onError(error: Int) {
+                isCurrentlyListening = false
+                val delay = when (error) {
+                    SpeechRecognizer.ERROR_NO_MATCH,
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> 200L
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
+                    SpeechRecognizer.ERROR_CLIENT -> {
+                        destroyRecognizer()
+                        800L
+                    }
+                    else -> 500L
+                }
+                scheduleRestart(delay)
+            }
+
+            override fun onResults(results: Bundle?) {
+                isCurrentlyListening = false
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val wakeMatch = findWakeMatch(matches)
+
+                if (wakeMatch != null) {
+                    triggerWake(wakeMatch.first, wakeMatch.second)
+                } else {
+                    scheduleRestart(150L)
+                }
+            }
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                val partials = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val wakeMatch = findWakeMatch(partials)
+                if (wakeMatch != null) {
+                    triggerWake(wakeMatch.first, wakeMatch.second)
+                }
+            }
+
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        }
+    }
+
+    private fun findWakeMatch(phrases: List<String>?): Pair<String, String?>? {
+        if (phrases.isNullOrEmpty()) return null
+
+        val targetPhrase = wakeWordPhrase.lowercase().trim()
+        val targetTokens = targetPhrase.split(" ").filter { it.isNotBlank() }
+
+        for (phrase in phrases) {
+            val clean = phrase.lowercase().trim()
+
+            // 1. Direct contains target phrase: e.g. "hey aura what is the time"
+            val indexInPhrase = clean.indexOf(targetPhrase)
+            if (indexInPhrase >= 0) {
+                val after = clean.substring(indexInPhrase + targetPhrase.length).trim()
+                return Pair(wakeWordPhrase, if (after.isNotBlank()) after else null)
+            }
+
+            // 2. Contains "aura" or "ora" keyword
+            val words = clean.split(" ")
+            for (i in words.indices) {
+                val w = words[i].replace(Regex("[^a-z]"), "")
+                if (w == "aura" || w == "ora" || w == "ayra" || w == "aurora") {
+                    val afterWords = words.subList(i + 1, words.size).joinToString(" ").trim()
+                    return Pair(wakeWordPhrase, if (afterWords.isNotBlank()) afterWords else null)
+                }
+            }
+
+            // 3. Normalized stripped match
+            val stripped = clean.replace(Regex("[^a-z0-9]"), "")
+            if (stripped.contains("aura") || stripped.contains("ora")) {
+                return Pair(wakeWordPhrase, null)
             }
         }
+        return null
     }
 
-    private fun processMatches(matches: List<String>?) {
-        if (matches == null) return
-        if (checkWakeWordMatch(matches)) {
-            triggerWakeWord()
-        }
-    }
-
-    private fun checkWakeWordMatch(phrases: List<String>): Boolean {
-        val target = wakeWordPhrase.lowercase().trim()
-        val normalizedTarget = target.replace(Regex("[^a-z0-9]"), "")
-
-        return phrases.any { phrase ->
-            val cleanPhrase = phrase.lowercase().trim()
-            val normalizedPhrase = cleanPhrase.replace(Regex("[^a-z0-9]"), "")
-
-            // Exact match, contains match, or phonetic sub-match
-            cleanPhrase.contains(target) ||
-                    normalizedPhrase.contains(normalizedTarget) ||
-                    (target.contains("aura") && cleanPhrase.contains("aura")) ||
-                    (target.contains("aura") && cleanPhrase.contains("ora"))
-        }
-    }
-
-    private fun triggerWakeWord() {
-        // Haptic pulse confirming wake word recognition
+    private fun triggerWake(phrase: String, extraCommand: String?) {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 vibrator?.vibrate(VibrationEffect.createOneShot(120L, VibrationEffect.DEFAULT_AMPLITUDE))
@@ -208,17 +228,36 @@ class WakeWordEngine(
             }
         } catch (_: Exception) {}
 
-        // Suspend wake loop while user delivers their command
+        cancelScheduledRestart()
         destroyRecognizer()
-        onWakeWordDetected(wakeWordPhrase)
+        onWakeWordDetected(phrase, extraCommand)
+    }
+
+    private fun scheduleRestart(delayMs: Long) {
+        if (!isRunning || isSuspended) return
+
+        cancelScheduledRestart()
+        restartRunnable = Runnable {
+            if (isRunning && !isSuspended) {
+                initAndListen()
+            }
+        }
+        val adjusted = (delayMs * (1.1f - (sensitivity * 0.3f))).toLong().coerceAtLeast(100L)
+        mainHandler.postDelayed(restartRunnable!!, adjusted)
+    }
+
+    private fun cancelScheduledRestart() {
+        restartRunnable?.let { mainHandler.removeCallbacks(it) }
+        restartRunnable = null
     }
 
     private fun destroyRecognizer() {
         try {
-            speechRecognizer?.stopListening()
+            speechRecognizer?.cancel()
             speechRecognizer?.destroy()
         } catch (_: Exception) {}
         speechRecognizer = null
+        isCurrentlyListening = false
     }
 
     fun release() {
